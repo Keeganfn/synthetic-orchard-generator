@@ -5,16 +5,13 @@ import random
 import math
 import numpy as np
 from copy import deepcopy
+import cv2 as cv
 from PIL import Image
+import json
+import pickle
 
 
 def setup_sim(gui=True):
-    if gui:
-        physicsClient = p.connect(p.GUI)
-    else:
-        physicsClient = p.connect(p.DIRECT)
-
-    # load in ground plane with dirt textures
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
     plane = p.loadURDF("plane.urdf")
     textureId = p.loadTexture("forest_ground_04_diff_2k.jpg")
@@ -176,7 +173,13 @@ def load_single_apple(position, orientation, type):
 
 
 def get_modal_masks(ids, img):
-    pass
+    modal_masks = {}
+    for i in ids:
+        mask = np.copy(img)
+        mask[mask == i] = 255
+        mask[mask != 255] = 0
+        modal_masks[i] = deepcopy(mask)
+    return modal_masks
 
 
 def get_amodal_masks(ids, apple_info, camera_info):
@@ -199,10 +202,33 @@ def get_amodal_masks(ids, apple_info, camera_info):
             camera_info["view_matrix"],
             camera_info["projection_matrix"],
             renderer=p.ER_BULLET_HARDWARE_OPENGL)[4]
+        amodal_mask[amodal_mask == new_id] = 255
+        amodal_mask[amodal_mask != 255] = 0
         p.removeBody(new_id)
         amodal_masks[i] = deepcopy(amodal_mask)
         p.stepSimulation()
     return amodal_masks
+
+
+def get_contours_bb(ids, imgs):
+    final_contour_bbs = {}
+    final_ids = []
+    for i in ids:
+        final_contours = []
+        final_bbs = []
+        img_gray = np.copy(imgs[i]).astype(np.uint8)
+        contours, hierarchy = cv.findContours(img_gray, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+        for j in contours:
+            if cv.contourArea(j) > 20:
+                final_contours.append(j.ravel().tolist())
+                final_bbs.append(list(cv.boundingRect(j)))
+        if len(final_contours) > 0:
+            final_ids.append(i)
+            final_contour_bbs[i] = deepcopy(
+                {"segmentation_polygon": deepcopy(final_contours),
+                 "bounding_box": deepcopy(final_bbs)})
+
+    return final_contour_bbs, final_ids
 
 
 def stall_sim():
@@ -212,29 +238,106 @@ def stall_sim():
 
 
 if __name__ == "__main__":
-    setup_sim()
-    tree_info = spawn_trees_preset_random()
-    camera_info = spawn_camera()
-    apple_info = spawn_apples(
-        camera_location=camera_info["camera_location"],
-        target_location=camera_info["target_location"])
-    image_info_modal = p.getCameraImage(
-        camera_info["width"],
-        camera_info["height"],
-        camera_info["view_matrix"],
-        camera_info["projection_matrix"],
-        renderer=p.ER_BULLET_HARDWARE_OPENGL)
-    print(image_info_modal[4])
-    apples_ids_in_image = get_image_apple_ids(apple_info["apple_ids"], image_info_modal[4])
-    amodal_masks = get_amodal_masks(apples_ids_in_image, apple_info, camera_info)
+    physicsClient = p.connect(p.DIRECT)
+    for trial in range(2000):
+        print("COMPLETED NUMBER ", trial)
+        save_data = None
+        setup_sim(gui=False)
+        tree_info = spawn_trees_preset_random()
+        camera_info = spawn_camera()
+        apple_info = spawn_apples(
+            camera_location=camera_info["camera_location"],
+            target_location=camera_info["target_location"])
+        image_info_modal = p.getCameraImage(
+            camera_info["width"],
+            camera_info["height"],
+            camera_info["view_matrix"],
+            camera_info["projection_matrix"],
+            renderer=p.ER_BULLET_HARDWARE_OPENGL)
+        apples_ids_in_image = get_image_apple_ids(apple_info["apple_ids"], image_info_modal[4])
+        amodal_masks = get_amodal_masks(apples_ids_in_image, apple_info, camera_info)
+        modal_masks = get_modal_masks(apples_ids_in_image, image_info_modal[4])
 
-    im = Image.fromarray(image_info_modal[2].astype(np.uint8))
-    im.show()
-    j = image_info_modal[4]
-    for i in apples_ids_in_image:
-        j[j == i] = 255
-    j[j != 255] = 0
-    print(j)
-    im = Image.fromarray(j.astype(np.uint8))
-    im.show()
-    im.save("test.png")
+        amodal_contours_bbs, amodal_final_ids = get_contours_bb(apples_ids_in_image, amodal_masks)
+        modal_contours_bbs, modal_final_ids = get_contours_bb(apples_ids_in_image, modal_masks)
+
+        im = Image.fromarray(image_info_modal[2].astype(np.uint8))
+        image_name = str(trial) + ".png"
+        im.save("data/images/" + image_name)
+
+        save_data = {
+            "image": image_name,
+            "apples_ids_in_modal": deepcopy(modal_final_ids),
+            "apples_ids_in_amodal": deepcopy(amodal_final_ids),
+            "amodal_mask_sim": deepcopy(amodal_masks),
+            "modal_masks_sim": deepcopy(modal_masks),
+            "segmentation_mask_all": deepcopy(image_info_modal[4]),
+            "depth_mask_all": deepcopy(image_info_modal[3]),
+            "amodal_contours_bbs": deepcopy(amodal_contours_bbs),
+            "modal_contours_bbs": deepcopy(modal_contours_bbs),
+            "apple_info": deepcopy(apple_info),
+            "camera_info": deepcopy(camera_info),
+            "tree_info": deepcopy(tree_info)}
+
+        pkl_name = str(trial) + ".pkl"
+        with open("data/sim_data/" + pkl_name, "wb") as f:
+            pickle.dump(deepcopy(save_data), f)
+
+        with open("data/coco_data/amodal.json", "r") as jsonFile:
+            coco_data_amodal = json.load(jsonFile)
+        new_image = None
+        new_image = {"id": trial, "width": 1024, "height": 1024,
+                     "file_name": image_name, "date_captured": "2023-06-11 05:21:23"}
+        coco_data_amodal["images"].append(deepcopy(new_image))
+        for i in amodal_final_ids:
+            new_annotations = None
+            new_annotations = {}
+            new_annotations["image_id"] = trial
+            new_annotations["category_id"] = 0
+            new_annotations["segmentation"] = deepcopy(amodal_contours_bbs[i]["segmentation_polygon"])
+            new_annotations["bbox"] = deepcopy(amodal_contours_bbs[i]["bounding_box"])
+            coco_data_amodal["annotations"].append(deepcopy(new_annotations))
+
+        with open("data/coco_data/amodal.json", "w") as jsonFile:
+            json.dump(coco_data_amodal, jsonFile)
+
+        with open("data/coco_data/modal.json", "r") as jsonFile:
+            coco_data_modal = json.load(jsonFile)
+        new_image = None
+        new_image = {"id": trial, "width": 1024, "height": 1024,
+                     "file_name": image_name, "date_captured": "2023-06-11 05:21:23"}
+        coco_data_modal["images"].append(deepcopy(new_image))
+        for i in modal_final_ids:
+            new_annotations = None
+            new_annotations = {}
+            new_annotations["image_id"] = trial
+            new_annotations["category_id"] = 0
+            new_annotations["segmentation"] = deepcopy(modal_contours_bbs[i]["segmentation_polygon"])
+            new_annotations["bbox"] = deepcopy(modal_contours_bbs[i]["bounding_box"])
+            coco_data_modal["annotations"].append(deepcopy(new_annotations))
+
+        with open("data/coco_data/modal.json", "w") as jsonFile:
+            json.dump(coco_data_modal, jsonFile)
+        p.resetSimulation()
+
+    # im = amodal_masks[apples_ids_in_image[0]].astype(np.uint8)
+    # im = np.zeros((1024, 1024)).astype(np.uint8)
+    # cv.imshow("image", im)
+    # cv.waitKey(0)
+
+    # im = cv.cvtColor(im, cv.COLOR_GRAY2RGB)
+    # print(modal_contours_bbs[modal_final_ids[0]]["segmentation_polygon"])
+    # cv.drawContours(im, modal_contours_bbs[modal_final_ids[0]]["segmentation_polygon"], -1, (0, 255, 0), 2)
+    # cv.drawContours(im, modal_contours_bbs[modal_final_ids[1]]["segmentation_polygon"], -1, (255, 0, 0), 2)
+    # cv.drawContours(im, amodal_contours_bbs[amodal_final_ids[1]]["segmentation_polygon"], -1, (0, 255, 0), 2)
+    # cv.imshow("image", im)
+    # cv.waitKey(0)
+
+    # j = image_info_modal[4]
+    # for i in apples_ids_in_image:
+    #     j[j == i] = 255
+    # j[j != 255] = 0
+    # print(j)
+    # im = Image.fromarray(j.astype(np.uint8))
+    # im.show()
+    # im.save("test.png")
